@@ -244,3 +244,7 @@ manifest.json
 wandb/
 onelogger.err
 onelogger.log
+
+# patch-time backups made while porting the goal-pose prior
+*.bak_*
+*.orig

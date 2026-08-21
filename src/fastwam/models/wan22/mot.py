@@ -479,12 +479,17 @@ class MoT(nn.Module):
         video_context: torch.Tensor,
         video_context_mask: torch.Tensor,
         video_attention_mask: torch.Tensor,
+        goal_prefill_hook=None,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         expert = self.mixtures["video"]
         x = video_tokens
         cache_k_list: list[torch.Tensor] = []
         cache_v_list: list[torch.Tensor] = []
         for layer_idx in range(self.num_layers):
+            if goal_prefill_hook is not None:
+                # `x` here is the state entering this layer, matching what the training
+                # hook sees in forward_joint_core.
+                goal_prefill_hook(layer_idx, x)
             block = expert.blocks[layer_idx]
             (
                 q,
@@ -535,10 +540,13 @@ class MoT(nn.Module):
         video_cache_k: list[torch.Tensor],
         video_cache_v: list[torch.Tensor],
         action_attention_mask: torch.Tensor,
+        action_context_layers=None,
     ) -> torch.Tensor:
         expert = self.mixtures["action"]
         x = action_tokens
         for layer_idx in range(self.num_layers):
+            if action_context_layers is not None:
+                action_context, action_context_mask = action_context_layers[layer_idx]
             block = expert.blocks[layer_idx]
             (
                 q_action,
@@ -675,7 +683,13 @@ class MoT(nn.Module):
         action_context: torch.Tensor,
         action_context_mask: torch.Tensor,
         attention_mask: torch.Tensor,
+        goal_hook=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if goal_hook is not None and self.compile_training_layers:
+            raise ValueError(
+                "`goal_hook` refreshes the action context per layer, which cannot be traced "
+                "by the compiled joint layer. Set compile_training_denoise=false."
+            )
         if self.training and self.compile_training_layers and not hasattr(self, "_compiled_joint_layer"):
             self._compiled_joint_layer = torch.compile(
                 self._forward_joint_layer,
@@ -690,6 +704,12 @@ class MoT(nn.Module):
                 if self.training and self.compile_training_layers
                 else self._forward_joint_layer
             )
+            if goal_hook is None:
+                layer_action_context, layer_action_context_mask = action_context, action_context_mask
+            else:
+                layer_action_context, layer_action_context_mask = goal_hook(
+                    layer_idx, x_video, action_context, action_context_mask
+                )
             x_video, x_action = layer(
                 video_block=self.mixtures["video"].blocks[layer_idx],
                 action_block=self.mixtures["action"].blocks[layer_idx],
@@ -701,8 +721,8 @@ class MoT(nn.Module):
                 action_t_mod=action_t_mod,
                 video_context=video_context,
                 video_context_mask=video_context_mask,
-                action_context=action_context,
-                action_context_mask=action_context_mask,
+                action_context=layer_action_context,
+                action_context_mask=layer_action_context_mask,
                 attention_mask=attention_mask,
             )
         return x_video, x_action

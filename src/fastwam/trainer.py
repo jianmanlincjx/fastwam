@@ -82,10 +82,23 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
+        # Filter on requires_grad: Stage 1 freezes the video expert, and handing frozen
+        # parameters to AdamW would still make ZeRO allocate optimizer state for them.
+        trainable_params = [p for p in self.model.dit.parameters() if p.requires_grad]
         proprio_encoder = getattr(self.model, "proprio_encoder", None)
         if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+            trainable_params.extend(p for p in proprio_encoder.parameters() if p.requires_grad)
+        goal_prior_params = getattr(self.model, "goal_prior_parameters", None)
+        if goal_prior_params is not None:
+            # Bare Parameters are not Modules, so they are not in dit.parameters().
+            trainable_params.extend(p for p in goal_prior_params() if p.requires_grad)
+        _gate = getattr(getattr(self.model, "semantic_visual_aggregator", None), "syn_gate_bias", None)
+        logger.info(
+            "optimizer receives %d tensors / %d params; syn_gate_bias included: %s",
+            len(trainable_params),
+            sum(p.numel() for p in trainable_params),
+            "n/a" if _gate is None else any(p is _gate for p in trainable_params),
+        )
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -96,7 +109,11 @@ class Wan22Trainer:
         self.train_loader = self._build_loader(self.train_dataset, worker_init_fn=worker_init_fn)
         total_train_steps = self._estimate_total_train_steps()
         self.max_steps = total_train_steps
-        warmup_steps = int(total_train_steps * 0.05)
+        # Honour an explicit warmup_steps when given; otherwise keep the 5% rule, which
+        # is what every stock config relies on. Stage 1 runs at 2x the baseline LR and
+        # wants ImageWAM's longer ramp, and a silently ignored key is worse than none.
+        cfg_warmup = getattr(cfg, "warmup_steps", None)
+        warmup_steps = int(cfg_warmup) if cfg_warmup else int(total_train_steps * 0.05)
         self.scheduler = self._build_scheduler(
             scheduler_type=cfg.lr_scheduler_type,
             total_train_steps=total_train_steps,
@@ -316,6 +333,11 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+        # Refine the DiT-only default for the goal-prior stages: Stage 1 freezes the
+        # video expert and opens the pose encoder, Stage 2 opens everything.
+        policy = getattr(model, "apply_trainable_policy", None)
+        if policy is not None:
+            policy()
 
     @staticmethod
     def _to_batched_eval_sample(sample):
@@ -698,6 +720,20 @@ class Wan22Trainer:
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
+                    _agg = getattr(self.accelerator.unwrap_model(self.model), 'semantic_visual_aggregator', None)
+                    if _agg is not None and self.global_step % max(1, self.log_every) == 0:
+                        # The gate is the core Stage 2 mechanism and its failure mode is silent,
+                        # so its actual value belongs in the training log.
+                        _g = _agg.syn_gate_bias
+                        try:
+                            from deepspeed.utils import safe_get_full_grad
+                            _fg = safe_get_full_grad(_g)
+                            _fg = None if _fg is None else [float(v) for v in _fg.detach().float()]
+                        except Exception as _e:
+                            _fg = 'unavailable: ' + type(_e).__name__
+                        logger.info('gate_probe effective=%r delta=%r',
+                                    [round(float(v), 6) for v in _g.detach().float()],
+                                    [round(float(v), 6) for v in _agg.syn_gate_delta.detach().float()])
                     grad_norm = self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.optimizer.step()
                     if not self.accelerator.optimizer_step_was_skipped:

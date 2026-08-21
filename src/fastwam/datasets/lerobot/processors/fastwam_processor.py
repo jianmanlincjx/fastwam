@@ -214,8 +214,9 @@ class FastWAMProcessor(BaseProcessor):
         sample["image_is_pad"] = data["image_is_pad"]
 
         # 2. image
+        images_available = bool(data.get("images"))
         processed_images = []
-        for meta in self.shape_meta["images"]:
+        for meta in (self.shape_meta["images"] if images_available else []):
             key, shape = meta["key"], meta["shape"]
             image = data["images"][key]  # [num_obs_steps, C, H, W]
             assert image.ndim == 4, f"Expected 4 dimensions (num_obs_steps, C, H, W), got shape {image.shape}"
@@ -231,8 +232,13 @@ class FastWAMProcessor(BaseProcessor):
                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 
             processed_images.append(image)
-        pixel_values = torch.stack(processed_images, dim=0) # [num_input_cameras, T, C, H, W]
-        
+        if not images_available:
+            # Vision-free: the smallest well-formed placeholder. Stage 1 skips both the
+            # VAE and the video expert, so nothing downstream ever reads it.
+            pixel_values = torch.zeros((self.num_output_cameras, self.num_image_steps, 3, 16, 16))
+        else:
+            pixel_values = torch.stack(processed_images, dim=0) # [num_input_cameras, T, C, H, W]
+
         if self.num_output_cameras > pixel_values.shape[0]:
             out = torch.zeros((self.num_output_cameras,) + pixel_values.shape[1:], device=pixel_values.device, dtype=pixel_values.dtype)
             out[0: pixel_values.shape[0]] = pixel_values

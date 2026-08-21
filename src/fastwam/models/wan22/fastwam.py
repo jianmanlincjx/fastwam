@@ -8,6 +8,21 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .goal_prior import (
+    GoalPoseEncoder,
+    GoalPoseDecoder,
+    SemanticVisualAggregator,
+    sample_channel_regime,
+    GOAL_PRIOR_NUM_LATENTS,
+    GOAL_PRIOR_NUM_POSE_TOKENS,
+    GOAL_PRIOR_LATENT_DIM,
+    GOAL_PRIOR_NUM_GROUPS,
+
+    extract_goal_pose,
+    GOAL_PRIOR_NUM_GOAL_TOKENS,
+    GOAL_PRIOR_INNER_DIM,
+    GOAL_PRIOR_STAGE1_NULL_TOKENS,
+)
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -38,6 +53,9 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_pose: float = 0.0,
+        goal_prior_stage: Optional[str] = None,
+        goal_prior: Optional[dict] = None,
         compile_training_denoise: bool = False,
     ):
         super().__init__()
@@ -85,6 +103,63 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.loss_lambda_pose = float(loss_lambda_pose)
+
+        # --- goal-pose prior --------------------------------------------------
+        # Stage 1 is vision-free: the action expert is given language, proprio and an
+        # oracle goal pose, and no pixels at all. The video expert is skipped outright
+        # rather than merely frozen -- with no video loss and no gradient its forward
+        # buys nothing, and dropping it is what makes a large batch affordable.
+        gp = dict(goal_prior or {})
+        self.goal_prior_stage = goal_prior_stage
+        self.goal_pose_encoder = None
+        self.stage1_null_tokens = None
+        if goal_prior_stage == "stage1":
+            pose_dim = int(gp.get("pose_dim", self.proprio_dim or 8))
+            self.goal_pose_encoder = GoalPoseEncoder(
+                pose_dim=pose_dim,
+                num_tokens=int(gp.get("num_goal_tokens", GOAL_PRIOR_NUM_GOAL_TOKENS)),
+                hidden_size=int(self.action_expert.hidden_dim),
+                inner_dim=int(gp.get("inner_dim", GOAL_PRIOR_INNER_DIM)),
+            ).to(torch_dtype)
+            # Stand-in for the visual span the action expert loses in Stage 1, so its
+            # self-attention has something to attend rather than only its own 32 action
+            # tokens. Appended *after* the action tokens so their RoPE positions stay
+            # 0..31, identical to Stage 2. Sample-independent and Stage 1 only.
+            n_null = int(gp.get("stage1_null_tokens", GOAL_PRIOR_STAGE1_NULL_TOKENS))
+            if n_null > 0:
+                null = torch.empty(n_null, self.action_expert.hidden_dim)
+                nn.init.trunc_normal_(null, std=0.02)
+                self.stage1_null_tokens = nn.Parameter(null.to(torch_dtype))
+        self.semantic_visual_aggregator = None
+        self.semantic_visual_pose_norm = None
+        self.semantic_visual_pose_decoder = None
+        self.goal_prior_p_ref_only = float(gp.get("p_ref_only", 0.20))
+        self.goal_prior_p_syn_only = float(gp.get("p_syn_only", 0.30))
+        if goal_prior_stage == "stage2":
+            latent_dim = int(gp.get("latent_dim", GOAL_PRIOR_LATENT_DIM))
+            n_pose = int(gp.get("num_pose_tokens", GOAL_PRIOR_NUM_POSE_TOKENS))
+            self.semantic_visual_aggregator = SemanticVisualAggregator(
+                num_tokens=int(gp.get("num_latents", GOAL_PRIOR_NUM_LATENTS)),
+                latent_dim=latent_dim,
+                semantic_dim=self.text_dim,
+                visual_dim=int(self.video_expert.hidden_dim),
+                out_dim=int(self.action_expert.hidden_dim),
+                num_layer_groups=int(gp.get("num_layer_groups", GOAL_PRIOR_NUM_GROUPS)),
+                num_pose_tokens=n_pose,
+                context_token_dropout=float(gp.get("context_token_dropout", 0.05)),
+                context_blackout_prob=float(gp.get("context_blackout_prob", 0.10)),
+                gate_bias_init=float(gp.get("syn_gate_bias_init", -2.0)),
+                gate_pose_tokens=bool(gp.get("gate_pose_tokens", False)),
+            ).to(torch_dtype)  # restore backbone dtype; the gate's precision is handled
+            # by storing it as a delta from its init rather than by casting the module
+            self.semantic_visual_pose_norm = nn.LayerNorm(latent_dim).to(torch_dtype)
+            self.semantic_visual_pose_decoder = GoalPoseDecoder(
+                num_tokens=n_pose,
+                hidden_size=latent_dim,
+                pose_dim=int(gp.get("pose_dim", self.proprio_dim or 8)),
+                inner_dim=int(gp.get("inner_dim", GOAL_PRIOR_INNER_DIM)),
+            ).to(torch_dtype)
         self.compile_training_denoise = bool(compile_training_denoise)
         self.mot.compile_training_layers = self.compile_training_denoise
 
@@ -114,6 +189,9 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        loss_lambda_pose: float = 0.0,
+        goal_prior_stage: Optional[str] = None,
+        goal_prior: Optional[dict] = None,
         compile_training_denoise: bool = False,
     ):
         if video_dit_config is None:
@@ -172,6 +250,9 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            loss_lambda_pose=loss_lambda_pose,
+            goal_prior_stage=goal_prior_stage,
+            goal_prior=goal_prior,
             compile_training_denoise=compile_training_denoise,
         )
         model.model_paths = {
@@ -336,8 +417,13 @@ class FastWAM(torch.nn.Module):
                     f"got {tuple(image_is_pad.shape)} vs expected ({batch_size}, {num_frames})"
                 )
         
-        input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        input_latents = self._encode_video_latents(input_video, tiled=tiled)
+        # Stage 1 never looks at pixels, so encoding all 33 frames through the VAE is
+        # pure waste -- and it was the dominant cost of the stage, not the DiT.
+        if self._skip_video_encoding():
+            input_latents = None
+        else:
+            input_video = video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            input_latents = self._encode_video_latents(input_video, tiled=tiled)
         context = sample.get("context")
         context_mask = sample.get("context_mask")
         if context is None and context_mask is None:
@@ -350,7 +436,7 @@ class FastWAM(torch.nn.Module):
 
         first_frame_latents = None
         fuse_flag = False
-        if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
+        if input_latents is not None and getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
             first_frame_latents = input_latents[:, :, 0:1]
             fuse_flag = True
 
@@ -369,6 +455,9 @@ class FastWAM(torch.nn.Module):
                 raise ValueError(
                     f"`sample['proprio']` last dim must be {self.proprio_dim}, got {proprio.shape[2]}"
                 )
+            goal_pose = extract_goal_pose(proprio).to(
+                device=self.device, dtype=self.torch_dtype
+            )
             proprio = proprio[:, 0, :] # [B, D]
             context, context_mask = self._append_proprio_to_context(
                 context=context,
@@ -383,6 +472,7 @@ class FastWAM(torch.nn.Module):
             image_is_pad = image_is_pad.to(device=self.device, dtype=torch.bool, non_blocking=True)
 
         return {
+            "goal_pose": goal_pose if self.proprio_encoder is not None else None,
             "context": context,
             "context_mask": context_mask,
             "input_latents": input_latents,
@@ -467,6 +557,7 @@ class FastWAM(torch.nn.Module):
         attention_mask: torch.Tensor,
         fuse_vae_embedding_in_latents: bool,
         action_condition: Optional[torch.Tensor] = None,
+        goal_hook=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run the tensor-only video/action core shared by training and inference."""
         (
@@ -513,14 +604,310 @@ class FastWAM(torch.nn.Module):
             action_context=context_action,
             action_context_mask=context_mask_action,
             attention_mask=attention_mask,
+            goal_hook=goal_hook,
         )
         return (
             self.video_expert.post(video_tokens, t_video, f_video, h_video, w_video),
             self.action_expert.post(action_tokens),
         )
 
+
+
+    def _skip_video_encoding(self) -> bool:
+        """True when the video branch is inert, so its VAE pass can be skipped.
+
+        Deliberately not gated on self.training: the trainer runs model.eval() and then
+        re-enables only model.dit, so the top-level module reports training=False for the
+        whole run. Stage 1 never encodes video in any mode anyway.
+        """
+        return self.goal_prior_stage == "stage1"
+
+    def _action_only_forward(
+        self,
+        action_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        goal_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Run the action expert alone, with no video tokens anywhere.
+
+        Mirrors `ActionDiT.forward` but appends the Stage 1 placeholder tokens to the
+        self-attention sequence and strips them before the head. They go after the
+        action tokens so the action RoPE positions are unchanged.
+        """
+        ae = self.action_expert
+        x, _t, t_mod, context_emb, _ctx_attn, _freqs = ae.prepare(
+            action_tokens=action_tokens,
+            timestep=timestep,
+            context=context,
+            context_mask=context_mask,
+        )
+        if goal_tokens is not None:
+            # After `text_embedding`, so the pose pathway is not filtered through a
+            # projection fitted to T5 features.
+            context_emb = torch.cat([context_emb, goal_tokens.to(context_emb.dtype)], dim=1)
+            context_mask = torch.cat(
+                [
+                    context_mask,
+                    torch.ones(
+                        (context_mask.shape[0], goal_tokens.shape[1]),
+                        dtype=context_mask.dtype,
+                        device=context_mask.device,
+                    ),
+                ],
+                dim=1,
+            )
+        n_action = x.shape[1]
+        if self.stage1_null_tokens is not None:
+            null = self.stage1_null_tokens.to(dtype=x.dtype, device=x.device)
+            x = torch.cat([x, null.unsqueeze(0).expand(x.shape[0], -1, -1)], dim=1)
+        seq_len = x.shape[1]
+        freqs = ae.get_freqs(seq_len)
+        ctx_attn = context_mask.unsqueeze(1).expand(-1, seq_len, -1)
+        for block in ae.blocks:
+            x = block(x, context_emb, t_mod, freqs, context_mask=ctx_attn)
+        return ae.post(x[:, :n_action])
+
+    def _stage1_training_loss(self, inputs, batch_size: int):
+        """Vision-free pose-conditioned action prior."""
+        action = inputs["action"]
+        action_is_pad = inputs["action_is_pad"]
+        goal_pose = inputs["goal_pose"]
+        if goal_pose is None:
+            raise ValueError("Stage 1 requires proprio so the goal pose can be taken from it.")
+
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size, device=self.device, dtype=action.dtype,
+        )
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+
+        pred_action = self._action_only_forward(
+            action_tokens=noisy_action,
+            timestep=timestep_action,
+            context=inputs["context"],
+            context_mask=inputs["context_mask"],
+            goal_tokens=self.goal_pose_encoder(goal_pose),
+        )
+
+        action_loss_token = F.mse_loss(
+            pred_action.float(), target_action.float(), reduction="none"
+        ).mean(dim=2)
+        if action_is_pad is not None:
+            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+        else:
+            action_loss_per_sample = action_loss_token.mean(dim=1)
+        action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
+            action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
+        )
+        loss_action = (action_loss_per_sample * action_weight).mean()
+
+        loss_total = self.loss_lambda_action * loss_action
+        return loss_total, {"loss_action": self.loss_lambda_action * float(loss_action.detach().item())}
+
+    def apply_trainable_policy(self) -> None:
+        """Stage 1 freezes the video expert; Stage 2 opens everything."""
+        self.action_expert.train()
+        self.action_expert.requires_grad_(True)
+        if self.goal_prior_stage == "stage1":
+            self.video_expert.eval()
+            self.video_expert.requires_grad_(False)
+            if self.goal_pose_encoder is not None:
+                self.goal_pose_encoder.train()
+                self.goal_pose_encoder.requires_grad_(True)
+            return
+        if self.goal_prior_stage == "stage2":
+            self.video_expert.train()
+            self.video_expert.requires_grad_(True)
+            for mod in (self.semantic_visual_aggregator, self.semantic_visual_pose_norm,
+                        self.semantic_visual_pose_decoder):
+                if mod is not None:
+                    mod.train()
+                    mod.requires_grad_(True)
+
+    def goal_prior_parameters(self):
+        """Bare Parameters are not Modules, so they have to be listed by hand."""
+        params = []
+        if self.goal_pose_encoder is not None:
+            params.extend(self.goal_pose_encoder.parameters())
+        if self.stage1_null_tokens is not None:
+            params.append(self.stage1_null_tokens)
+        for mod in (self.semantic_visual_aggregator, self.semantic_visual_pose_norm,
+                    self.semantic_visual_pose_decoder):
+            if mod is not None:
+                params.extend(mod.parameters())
+        return params
+
+
+
+    def _stage2_infer_context_layers(self, base_ctx, base_mask, goal_syn_layers):
+        """Per-layer (context, mask) with the goal latents appended and gated.
+
+        Dropout, blackout and the channel regime are training-only, so every latent is
+        visible here -- the deployment condition is `both`.
+        """
+        agg = self.semantic_visual_aggregator
+        keep = torch.ones(
+            (base_mask.shape[0], agg.num_tokens), dtype=torch.bool, device=base_ctx.device
+        )
+        return [
+            self._stage2_action_context(base_ctx, base_mask, syn, gate, keep)
+            for syn, gate in goal_syn_layers
+        ]
+
+    def _stage2_goal_prefill(self, context, context_mask, tokens_per_frame, batch_size, device, dtype):
+        """Collect the per-layer goal latents while the video cache is being filled."""
+        agg = self.semantic_visual_aggregator
+        num_layers = int(len(self.action_expert.blocks))
+        semantic_pad = ~context_mask
+        state = {"q": agg.init_queries(batch_size, device, dtype)}
+        collected = []
+
+        def hook(layer_idx, x_video):
+            state["q"] = agg.forward_layer(
+                state["q"], context, x_video[:, :tokens_per_frame],
+                layer_idx=layer_idx, num_layers=num_layers, semantic_mask=semantic_pad)
+            collected.append((agg.to_action(state["q"]), agg.gate_for_layer(layer_idx, num_layers)))
+
+        return hook, collected
+
+    def _stage2_action_context(self, base_ctx, base_mask, syn_tokens, gate_bias, keep):
+        """Action cross-attention context with the goal latents appended and gated.
+
+        The gate is an additive bias on the latent columns, which is exactly what
+        F.scaled_dot_product_attention does with a float mask, so no attention code has
+        to change. `keep` carries the per-token dropout / blackout / syn-regime decisions.
+        """
+        agg = self.semantic_visual_aggregator
+        ctx = torch.cat([base_ctx, syn_tokens.to(base_ctx.dtype)], dim=1)
+        b, q_len, l_text = base_mask.shape
+        n_syn = syn_tokens.shape[1]
+        visible = torch.cat([base_mask, keep.unsqueeze(1).expand(-1, q_len, -1)], dim=2)
+        # Built in fp32 like ImageWAM's `_flux2_gate_action_mask`, then cast once at the
+        # end: the gate's own arithmetic must not run at bf16 resolution.
+        blocked = torch.zeros(visible.shape, dtype=torch.float32, device=ctx.device)
+        blocked = blocked.masked_fill(~visible, float("-inf"))
+        lo, hi = agg.gated_span()
+        gate_column = torch.zeros(l_text + n_syn, dtype=torch.float32, device=ctx.device)
+        gate_column[l_text + lo : l_text + hi] = 1.0
+        mask = blocked + gate_bias.float() * gate_column
+        return ctx, mask.to(ctx.dtype)
+
+    def _stage2_training_loss(self, inputs, batch_size: int):
+        agg = self.semantic_visual_aggregator
+        input_latents = inputs["input_latents"]
+        context, context_mask = inputs["context"], inputs["context_mask"]
+        action, action_is_pad = inputs["action"], inputs["action_is_pad"]
+        goal_pose = inputs["goal_pose"]
+        device = input_latents.device
+        training = agg.training
+
+        noise_video = torch.randn_like(input_latents)
+        timestep_video = self.train_video_scheduler.sample_training_t(
+            batch_size=batch_size, device=self.device, dtype=input_latents.dtype)
+        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
+        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+        if inputs["first_frame_latents"] is not None:
+            latents[:, :, 0:1] = inputs["first_frame_latents"]
+
+        noise_action = torch.randn_like(action)
+        timestep_action = self.train_action_scheduler.sample_training_t(
+            batch_size=batch_size, device=self.device, dtype=action.dtype)
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+
+        patch_t, patch_h, patch_w = (int(size) for size in self.video_expert.patch_size)
+        latent_t, latent_h, latent_w = latents.shape[-3:]
+        tokens_per_frame = (latent_h // patch_h) * (latent_w // patch_w)
+        video_seq_len = (latent_t // patch_t) * tokens_per_frame
+        attention_mask = self._build_mot_attention_mask(
+            video_seq_len=video_seq_len, action_seq_len=noisy_action.shape[1],
+            video_tokens_per_frame=tokens_per_frame, device=device)
+
+        # Plan B: sample which channels each sample may use, so neither is reliable and
+        # the policy has to work from either.
+        ref_keep, syn_keep = sample_channel_regime(
+            batch_size, device, self.goal_prior_p_ref_only, self.goal_prior_p_syn_only, training)
+        if ref_keep is not None and not bool(ref_keep.all()):
+            # Per-sample now, so the shared [S, S] mask becomes [B, 1, S, S].
+            attention_mask = attention_mask.unsqueeze(0).expand(batch_size, -1, -1).clone()
+            attention_mask[~ref_keep, video_seq_len:, :tokens_per_frame] = False
+            attention_mask = attention_mask.unsqueeze(1)
+
+        keep = agg.context_keep_mask(batch_size, device, training)
+        if syn_keep is not None:
+            keep = keep & syn_keep.unsqueeze(1)
+
+        semantic_pad = ~context_mask
+        state = {"q": agg.init_queries(batch_size, device, context.dtype), "last": None}
+        num_layers = int(len(self.action_expert.blocks))
+
+        def goal_hook(layer_idx, x_video, base_ctx, base_mask):
+            # First frame only: at inference `infer_action` has nothing else, so reading
+            # the later frames here would train an oracle that vanishes at test time.
+            visual = x_video[:, :tokens_per_frame]
+            state["q"] = agg.forward_layer(
+                state["q"], context, visual,
+                layer_idx=layer_idx, num_layers=num_layers, semantic_mask=semantic_pad)
+            state["last"] = state["q"]
+            return self._stage2_action_context(
+                base_ctx, base_mask, agg.to_action(state["q"]),
+                agg.gate_for_layer(layer_idx, num_layers), keep)
+
+        pred_video, pred_action = self._joint_denoise_core(
+            latents_video=latents, latents_action=noisy_action,
+            timestep_video=timestep_video, timestep_action=timestep_action,
+            context=context, context_mask=context_mask,
+            attention_mask=attention_mask,
+            fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
+            action_condition=action, goal_hook=goal_hook)
+
+        include_initial_video_step = inputs["first_frame_latents"] is None
+        if inputs["first_frame_latents"] is not None:
+            pred_video = pred_video[:, :, 1:]
+            target_video = target_video[:, :, 1:]
+        loss_video_per_sample = self._compute_video_loss_per_sample(
+            pred_video=pred_video, target_video=target_video,
+            image_is_pad=inputs["image_is_pad"],
+            include_initial_video_step=include_initial_video_step)
+        loss_video = (loss_video_per_sample * self.train_video_scheduler.training_weight(
+            timestep_video).to(loss_video_per_sample.device, dtype=loss_video_per_sample.dtype)).mean()
+
+        action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
+        if action_is_pad is not None:
+            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
+            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
+        else:
+            action_loss_per_sample = action_loss_token.mean(dim=1)
+        loss_action = (action_loss_per_sample * self.train_action_scheduler.training_weight(
+            timestep_action).to(action_loss_per_sample.device, dtype=action_loss_per_sample.dtype)).mean()
+
+        # Pose readout. This is the only thing pinning the first 8 latents to actually
+        # carry pose; without it they drift into ordinary context and "pose columns stay
+        # ungated" stops meaning anything.
+        pose_hidden = self.semantic_visual_pose_norm(state["last"][:, : agg.num_pose_tokens])
+        pred_pose = self.semantic_visual_pose_decoder(pose_hidden)
+        loss_pose = F.mse_loss(pred_pose.float(), goal_pose.float())
+
+        loss_total = (self.loss_lambda_video * loss_video
+                      + self.loss_lambda_action * loss_action
+                      + self.loss_lambda_pose * loss_pose)
+        return loss_total, {
+            "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
+            "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
+            "loss_pose": self.loss_lambda_pose * float(loss_pose.detach().item()),
+            "syn_gate_bias": float(agg.syn_gate_bias.detach().mean().item()),
+        }
+
     def training_loss(self, sample, tiled: bool = False):
         inputs = self.build_inputs(sample, tiled=tiled)
+        if self.goal_prior_stage == "stage1":
+            return self._stage1_training_loss(inputs, inputs["action"].shape[0])
+        if self.goal_prior_stage == "stage2":
+            return self._stage2_training_loss(inputs, inputs["action"].shape[0])
         input_latents = inputs["input_latents"]
         batch_size = input_latents.shape[0]
         context = inputs["context"]
@@ -709,6 +1096,7 @@ class FastWAM(torch.nn.Module):
         video_cache_k: list[torch.Tensor],
         video_cache_v: list[torch.Tensor],
         action_attention_mask: torch.Tensor,
+        goal_syn_layers=None,
     ) -> torch.Tensor:
         (
             action_tokens,
@@ -723,6 +1111,11 @@ class FastWAM(torch.nn.Module):
             context=context,
             context_mask=context_mask,
         )
+        action_context_layers = None
+        if goal_syn_layers is not None:
+            action_context_layers = self._stage2_infer_context_layers(
+                action_context, action_context_mask, goal_syn_layers
+            )
         action_tokens = self.mot.forward_action_with_video_cache_tensor(
             action_tokens=action_tokens,
             action_freqs=action_freqs,
@@ -732,6 +1125,7 @@ class FastWAM(torch.nn.Module):
             video_cache_k=video_cache_k,
             video_cache_v=video_cache_v,
             action_attention_mask=action_attention_mask,
+            action_context_layers=action_context_layers,
         )
         return self.action_expert.post(action_tokens)
 
@@ -1115,6 +1509,28 @@ class FastWAM(torch.nn.Module):
         else:
             prefill_video_cache = self.mot.prefill_video_cache_tensor
             denoise_action_with_video_cache = self._denoise_action_with_video_cache
+        # Stage 2 was trained with the goal latents in the action context, so they have to
+        # be there at test time too. They depend only on the video stream, which never
+        # attends the action stream, so one pass during prefill covers every denoise step.
+        goal_hook = None
+        goal_syn_layers = None
+        if self.semantic_visual_aggregator is not None:
+            if compile_action_infer:
+                raise ValueError(
+                    "`compile_action_infer` cannot trace the per-layer goal context; "
+                    "run Stage 2 inference without it."
+                )
+            goal_hook, goal_syn_layers = self._stage2_goal_prefill(
+                # The raw T5 context (text_dim), not the video expert's projected copy:
+                # the aggregator's semantic stream is sized for the former, and training
+                # feeds it exactly this tensor.
+                context=context,
+                context_mask=context_mask,
+                tokens_per_frame=tokens_per_frame,
+                batch_size=video_tokens.shape[0],
+                device=video_tokens.device,
+                dtype=video_tokens.dtype,
+            )
         if compile_action_infer:
             torch.compiler.cudagraph_mark_step_begin()
         video_cache_k, video_cache_v = prefill_video_cache(
@@ -1124,7 +1540,13 @@ class FastWAM(torch.nn.Module):
             video_context=video_context,
             video_context_mask=video_context_mask,
             video_attention_mask=video_attention_mask,
+            **({} if goal_hook is None else {"goal_prefill_hook": goal_hook}),
         )
+        if goal_syn_layers is not None and len(goal_syn_layers) != int(len(self.action_expert.blocks)):
+            raise ValueError(
+                f"goal latents collected for {len(goal_syn_layers)} layers, expected "
+                f"{len(self.action_expert.blocks)}"
+            )
         if compile_action_infer:
             # Inductor reduce-overhead may return graph-owned buffers that are overwritten on replay.
             video_cache_k = [cache.clone() for cache in video_cache_k]
@@ -1143,6 +1565,7 @@ class FastWAM(torch.nn.Module):
 
             pred_action_posi = denoise_action_with_video_cache(
                 latents_action=latents_action,
+                goal_syn_layers=goal_syn_layers,
                 timestep_action=timestep_action,
                 context=context,
                 context_mask=context_mask,
@@ -1196,6 +1619,45 @@ class FastWAM(torch.nn.Module):
             tiled=tiled,
         )
 
+
+    GOAL_PRIOR_CHECKPOINT_MODULES = (
+        "goal_pose_encoder",
+        "semantic_visual_aggregator",
+        "semantic_visual_pose_norm",
+        "semantic_visual_pose_decoder",
+    )
+
+    def _goal_prior_state(self):
+        payload = {}
+        for name in self.GOAL_PRIOR_CHECKPOINT_MODULES:
+            mod = getattr(self, name, None)
+            if mod is not None:
+                payload[name] = mod.state_dict()
+        if getattr(self, "stage1_null_tokens", None) is not None:
+            payload["stage1_null_tokens"] = self.stage1_null_tokens.detach().cpu()
+        return payload
+
+    def _load_goal_prior_state(self, payload):
+        """Missing entries are expected at the Stage 1 -> Stage 2 handoff: the oracle
+        encoder and the placeholder retire, and the aggregator is new."""
+        for name in self.GOAL_PRIOR_CHECKPOINT_MODULES:
+            mod = getattr(self, name, None)
+            if mod is None:
+                continue
+            if name in payload:
+                mod.load_state_dict(payload[name], strict=True)
+            else:
+                logger.info("Checkpoint has no `%s`; keeping the freshly initialised module.", name)
+        null = getattr(self, "stage1_null_tokens", None)
+        if null is not None and "stage1_null_tokens" in payload:
+            saved = payload["stage1_null_tokens"]
+            if tuple(saved.shape) != tuple(null.shape):
+                raise ValueError(
+                    f"`stage1_null_tokens` shape mismatch: checkpoint {tuple(saved.shape)} "
+                    f"vs model {tuple(null.shape)}"
+                )
+            null.data.copy_(saved.to(device=null.device, dtype=null.dtype))
+
     def save_checkpoint(self, path, optimizer=None, step=None):
         payload = {
             "mot": self.mot.state_dict(),
@@ -1204,6 +1666,9 @@ class FastWAM(torch.nn.Module):
         }
         if self.proprio_encoder is not None:
             payload["proprio_encoder"] = self.proprio_encoder.state_dict()
+        goal_prior = self._goal_prior_state()
+        if goal_prior:
+            payload["goal_prior"] = goal_prior
         if optimizer is not None:
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
@@ -1225,6 +1690,7 @@ class FastWAM(torch.nn.Module):
         elif "proprio_encoder" in payload:
             logger.warning("Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring.")
 
+        self._load_goal_prior_state(payload.get("goal_prior", {}))
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
         return payload

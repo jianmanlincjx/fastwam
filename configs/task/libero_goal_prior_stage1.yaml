@@ -1,0 +1,33 @@
+# @package _global_
+#
+# Stage 1: 10,000 steps, deliberately the same count ImageWAM used. Batch is larger
+# than Stage 2's because skipping the video expert removes ~882 of the ~914 tokens.
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam_goal_prior_stage1
+  - _self_
+
+batch_size: 64
+num_workers: 8
+
+lr_scheduler_type: "cosine"
+learning_rate: 2.0e-4
+warmup_steps: 2000
+num_epochs: 1
+max_steps: 10000
+log_every: 10
+save_every: 5000
+eval_every: 0
+
+gradient_accumulation_steps: 1
+weight_decay: 1.0e-2
+mixed_precision: "bf16"
+resume: null
+
+model:
+  mot_checkpoint_mixed_attn: false
+
+data:
+  train:
+    # Stage 1 never looks at pixels; stop the dataloader decoding 33 frames per sample.
+    vision_free: true

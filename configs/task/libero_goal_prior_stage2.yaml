@@ -1,0 +1,48 @@
+# @package _global_
+#
+# Stage 2 deliberately mirrors FastWAM's own LIBERO recipe
+# (configs/task/libero_uncond_2cam224_1e-4.yaml) field for field: same batch, same LR,
+# same schedule, same epoch count. Only the model changes. That way Stage 2 takes no
+# extra steps over the published baseline and the comparison cannot be waved away as
+# "they just trained longer" -- Stage 1 is the one declared increment.
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam_goal_prior_stage2
+  - _self_
+
+# --- identical to the baseline recipe ---------------------------------------
+batch_size: 16
+num_workers: 8
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+# 30k rather than the baseline recipe's 10 epochs (= 21,700 steps at global batch 128,
+# since LeRobot counts every frame as a window start). Chosen so the FastWAM baseline we
+# train later can use the same count and be step-matched exactly -- aligning to a recipe
+# we never ran ourselves is weaker. It is 1.38x the published recipe's steps, which the
+# writeup states outright.
+num_epochs: 100
+max_steps: 30000
+log_every: 10
+eval_every: 200
+
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+# warmup_steps left unset on purpose: the trainer's 5% rule then applies, exactly as it
+# does for the baseline. Stage 1 overrides it because it runs at 2x this LR.
+
+# --- ours -------------------------------------------------------------------
+# Every 5k: LIBERO-Plus punishes overfitting to the training distribution, and 30k is
+# 1.38x the published recipe, so whether the extra steps help or hurt has to be an
+# observation rather than a guess. The 30k checkpoint is the primary result -- the others
+# exist to show the trend, not to be picked from after the fact.
+save_every: 5000
+mixed_precision: "bf16"
+# Initialised from Stage 1. `resume` loads weights only (no optimizer/step), which is
+# what we want: a fresh schedule over the Stage 1 prior.
+resume: null
+
+model:
+  mot_checkpoint_mixed_attn: false
+  # The goal hook rebuilds the action context every layer, which cannot be traced.
+  compile_training_denoise: false

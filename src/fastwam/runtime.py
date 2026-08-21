@@ -86,6 +86,8 @@ def create_fastwam(
     video_scheduler=None,
     action_scheduler=None,
     loss=None,
+    goal_prior_stage: str | None = None,
+    goal_prior=None,
     mot_checkpoint_mixed_attn: bool = False,
     compile_training_denoise: bool = False,
     redirect_common_files: bool = True,
@@ -93,6 +95,11 @@ def create_fastwam(
     device: str = "cuda",
 ):
     from .models.wan22.fastwam import FastWAM
+
+    if isinstance(goal_prior, DictConfig):
+        goal_prior = OmegaConf.to_container(goal_prior, resolve=True)
+    if goal_prior is None:
+        goal_prior = {}
 
     if isinstance(video_dit_config, DictConfig):
         video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
@@ -156,6 +163,9 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        loss_lambda_pose=float(loss.get("lambda_pose", 0.0)),
+        goal_prior_stage=goal_prior_stage,
+        goal_prior=goal_prior,
         compile_training_denoise=bool(compile_training_denoise),
     )
 
