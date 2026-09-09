@@ -214,6 +214,7 @@ def _obs_to_model_input(
         wrist_h, wrist_w = _meta_to_hw(image_meta[1], camera_idx=1)
         primary = _center_crop_resize(imgs["image"], width=primary_w, height=primary_h)
         wrist = _center_crop_resize(imgs["wrist_image"], width=wrist_w, height=wrist_h)
+        globals()["_ATTN_VIEWS"] = (primary, wrist)   # what the model actually sees
         if concatenation == "horizontal":
             rgb = np.concatenate([primary, wrist], axis=1)
         elif concatenation == "vertical":
@@ -436,6 +437,24 @@ def _predict_action_chunk(
                 compile_action_infer=compile_action_infer,
             )
     action = pred["action"]  # [T, D]
+
+    _dump_dir = os.environ.get("FASTWAM_ATTN_DUMP")
+    if _dump_dir:
+        from fastwam.models.wan22.goal_prior import _CrossAttentionBlock as _CAB
+        if _CAB.ATTN_SINK:
+            import numpy as _np
+            _d = Path(_dump_dir); _d.mkdir(parents=True, exist_ok=True)
+            _n = len(list(_d.glob("attn_*.npz")))
+            # one entry per visual cross-attention call: 5 groups x the layers each covers
+            _w = _np.stack([a.numpy() for a in _CAB.ATTN_SINK])   # [calls, B, n_latents, n_vis]
+            _v = globals().get("_ATTN_VIEWS")
+            _pri, _wri = (_np.asarray(_v[0]), _np.asarray(_v[1])) if _v else (
+                _np.zeros((1, 1, 3), "uint8"), _np.zeros((1, 1, 3), "uint8"))
+            _np.savez_compressed(_d / f"attn_{_n:04d}.npz", attn=_w,
+                                 primary=_pri, wrist=_wri, step=_n)
+            logging.info("attn dump %s: attn%s primary%s wrist%s",
+                         _n, _w.shape, _pri.shape, _wri.shape)
+        _CAB.ATTN_SINK.clear()
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
 
@@ -730,12 +749,18 @@ def _run_task_to_file(
 
     task_suite = benchmark.get_benchmark_dict()[suite_name]()
     task = task_suite.get_task(task_id)
-    init_states_path = (
-        Path(get_libero_path("init_states"))
-        / task.problem_folder
-        / task.init_states_file
-    )
-    initial_states = torch.load(init_states_path, weights_only=False)
+    # LIBERO-plus names perturbed tasks after init files that do not exist on disk and
+    # resolves them inside the benchmark, so ask the benchmark rather than rebuilding the
+    # path. Base LIBERO answers the same way, so this is not a special case for Plus.
+    if hasattr(task_suite, "get_task_init_states"):
+        initial_states = task_suite.get_task_init_states(int(task_id))
+    else:
+        init_states_path = (
+            Path(get_libero_path("init_states"))
+            / task.problem_folder
+            / task.init_states_file
+        )
+        initial_states = torch.load(init_states_path, weights_only=False)
     while len(initial_states) < int(task_cfg.EVALUATION.num_trials):
         initial_states.extend(
             initial_states[: int(task_cfg.EVALUATION.num_trials) - len(initial_states)]
@@ -812,6 +837,10 @@ def _run_worker_loop(
     write_worker_status(status_dir, worker_id, "idle", "model loaded")
     completed = 0
     skipped = 0
+    # A single flaky env should not end a 10k-task run, but a systematic breakage
+    # (bad config, missing asset) fails every task -- so consecutive errors still abort.
+    consecutive_failures = 0
+    max_consecutive_failures = int(os.environ.get("LIBERO_MAX_CONSECUTIVE_FAILURES", "5"))
     while not stop_file.exists():
         task = pop_task(pending_file, lock_file, status_dir, worker_id)
         if task is None:
@@ -851,7 +880,15 @@ def _run_worker_loop(
                 "failed",
                 f"{suite_name},{task_id}: {exc!r}",
             )
-            raise
+            consecutive_failures += 1
+            if consecutive_failures >= max_consecutive_failures:
+                raise
+            print(
+                f"worker {worker_id} skipping {suite_name},{task_id} after error "
+                f"({consecutive_failures}/{max_consecutive_failures}): {exc!r}"
+            )
+            continue
+        consecutive_failures = 0
 
     write_worker_status(
         status_dir,

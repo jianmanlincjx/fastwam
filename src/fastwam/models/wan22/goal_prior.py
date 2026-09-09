@@ -183,11 +183,20 @@ class _CrossAttentionBlock(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
+    ATTN_SINK = []          # filled only while FASTWAM_ATTN_DUMP is set
+
     def forward(self, queries, context, key_padding_mask=None):
-        out = self.cross_attn(
+        import os as _os
+        _dump = bool(_os.environ.get("FASTWAM_ATTN_DUMP")) and getattr(self, "_stream", None) == "visual"
+        _o = self.cross_attn(
             self.query_norm(queries), self.context_norm(context), self.context_norm(context),
-            key_padding_mask=key_padding_mask, need_weights=False,
-        )[0]
+            key_padding_mask=key_padding_mask, need_weights=_dump,
+            **({"average_attn_weights": True} if _dump else {}),
+        )
+        out = _o[0]
+        if _dump and _o[1] is not None:
+            # (B, n_latents, n_visual_tokens), heads already averaged
+            _CrossAttentionBlock.ATTN_SINK.append(_o[1].detach().float().cpu())
         queries = queries + self.dropout(out)
         return queries + self.dropout(self.ffn(self.ffn_norm(queries)))
 
@@ -200,6 +209,8 @@ class _AggregatorGroup(nn.Module):
         self.self_attn = _SelfAttentionBlock(latent_dim, num_heads, ffn_ratio, dropout)
         self.semantic = _CrossAttentionBlock(latent_dim, semantic_dim, num_heads, ffn_ratio, dropout)
         self.visual = _CrossAttentionBlock(latent_dim, visual_dim, num_heads, ffn_ratio, dropout)
+        self.semantic._stream = "semantic"
+        self.visual._stream = "visual"      # only this one maps back onto pixels
 
     def forward(self, queries, semantic_hidden, visual_hidden, semantic_mask=None):
         queries = self.self_attn(queries)

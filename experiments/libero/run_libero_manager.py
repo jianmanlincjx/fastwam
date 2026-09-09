@@ -176,15 +176,23 @@ def run_evaluation(
         print(f"forwarded overrides: {extra_args_display}")
     print("recovery: quarantine a crashed GPU and requeue its unfinished task")
 
+    per_gpu = max(1, int(os.environ.get("WORKERS_PER_GPU", "1")))
+    if per_gpu > 1:
+        print(f"workers per GPU: {per_gpu}")
+    slots = [(g, i) for g in gpu_ids for i in range(per_gpu)]
+
     workers: dict[str, tuple[subprocess.Popen, Path, TextIO]] = {}
-    for gpu_id in gpu_ids:
-        log_file = log_dir / f"worker_{gpu_id}.log"
+    for gpu_id, slot in slots:
+        # Unique per worker, not per card: the id names the status/lock bookkeeping, and
+        # two workers sharing one would clobber each other's state.
+        worker_key = gpu_id if per_gpu == 1 else f"{gpu_id}s{slot}"
+        log_file = log_dir / f"worker_{worker_key}.log"
         worker_env = base_env.copy()
         worker_env.update(
             {
                 "CUDA_VISIBLE_DEVICES": gpu_id,
                 "LIBERO_WORKER_MODE": "1",
-                "LIBERO_WORKER_ID": gpu_id,
+                "LIBERO_WORKER_ID": worker_key,
                 "LIBERO_WORKER_PENDING_FILE": str(pending_file),
                 "LIBERO_WORKER_LOCK_FILE": str(lock_file),
                 "LIBERO_WORKER_STOP_FILE": str(stop_file),
@@ -213,13 +221,14 @@ def run_evaluation(
             stderr=subprocess.STDOUT,
             text=True,
         )
-        workers[gpu_id] = (process, log_file, log_handle)
-        print(f"started worker GPU{gpu_id}: {log_file}")
+        workers[worker_key] = (process, log_file, log_handle)
+        print(f"started worker GPU{gpu_id} slot{slot}: {log_file}")
 
     status_interval = int(os.environ.get("STATUS_INTERVAL", "60"))
     monitor_interval = int(os.environ.get("MONITORING_INTERVAL", "5"))
     last_status_time = 0.0
     terminal_error = None
+    max_task_errors = int(os.environ.get("MAX_TASK_ERRORS", "25"))
 
     try:
         while workers:
@@ -240,9 +249,17 @@ def run_evaluation(
                     if requeue_task(pending_file, lock_file, current_task):
                         print(f"requeued GPU{gpu_id} task: {current_task[0]},{current_task[1]}")
 
-                if failed_file.stat().st_size > 0:
-                    terminal_error = f"worker GPU{gpu_id} reported a task error; log: {log_file}"
+                task_errors = sum(
+                    1 for line in failed_file.read_text(encoding="utf-8").splitlines() if line.strip()
+                )
+                if task_errors > max_task_errors:
+                    terminal_error = (
+                        f"{task_errors} task errors exceed MAX_TASK_ERRORS={max_task_errors}; "
+                        f"last worker log: {log_file}"
+                    )
                     break
+                if task_errors:
+                    print(f"tolerating {task_errors}/{max_task_errors} task errors so far")
                 print(
                     f"worker GPU{gpu_id} exited with code {returncode}; "
                     f"GPU{gpu_id} is quarantined for this run. Log: {log_file}"
