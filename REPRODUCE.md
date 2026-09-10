@@ -44,6 +44,40 @@ python scripts/train.py task=sim_libero_goal_prior \
 Interface settings are identical to the other three backbones and were not tuned per model:
 `num_latents=100`, `num_pose_tokens=8`, `latent_dim=768`, `inner_dim=512`, `lambda_pose=0.3`.
 
+## Environment for evaluation
+
+`pyproject.toml` pins the model stack (torch 2.7.1+cu128) but not the simulator. Verified on a fresh
+machine on 2026-09-10 with:
+
+```bash
+uv venv --python 3.12 .venv && source .venv/bin/activate
+UV_INDEX_STRATEGY=unsafe-best-match \
+UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128 uv pip install -e .
+
+# LIBERO / LIBERO-Plus and their runtime deps (not declared by LIBERO-plus's setup.py)
+ln -s /path/to/LIBERO-plus third_party/LIBERO-plus
+uv pip install -e third_party/LIBERO-plus \
+  robosuite==1.4.0 bddl==1.0.1 gym==0.25.2 mujoco==3.8.1 \
+  Wand h5py scikit-image future easydict thop einops matplotlib cloudpickle imageio imageio-ffmpeg
+```
+
+`Wand` needs the ImageMagick shared library (`libMagickWand`) on the system. Do not install
+`robomimic` (its `egl-probe` dependency fails to build and is not needed).
+
+Backbone weights are resolved relative to the repository root: `checkpoints/` must contain
+`Wan-AI/` (Wan2.2-TI2V-5B and the Wan2.1 tokenizer), `ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt`
+and `prompt_cache.pt`, as for the released FAST-WAM.
+
+Pick the GPU with `CUDA_VISIBLE_DEVICES=<id>` and pass `gpu_id=0`; `gpu_id` indexes the visible devices.
+Single-task check (about 30 s for two rollouts):
+
+```bash
+export PYTHONPATH=$PWD/third_party/LIBERO-plus:$PWD/src MUJOCO_GL=egl
+CUDA_VISIBLE_DEVICES=0 python experiments/libero/eval_libero_single.py --config-name sim_libero_goal_prior \
+  ckpt=<stage2>/step_030000.pt EVALUATION.dataset_stats_path=<stage2>/dataset_stats.json gpu_id=0 \
+  EVALUATION.task_suite_name=libero_spatial EVALUATION.task_id=0 EVALUATION.num_trials=2
+```
+
 ## Evaluation
 
 ### LIBERO (in-distribution)
