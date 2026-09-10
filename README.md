@@ -1,445 +1,132 @@
-> **Latent Interface Training (LIT) — this fork.**
-> This repository is the FAST-WAM instantiation of *Breaking the Vision–Action Shortcut: Latent
-> Interface Training for Generalizable Robot Foundation Models*. The upstream README follows
-> below unchanged. For the paper's training recipe, evaluation protocols and checkpoint map,
-> read [`REPRODUCE.md`](./REPRODUCE.md); the cross-framework hub, project page and released
-> checkpoints are at [jianmanlincjx/LIT](https://github.com/jianmanlincjx/LIT).
-> Use branch `feat/goal-pose-prior`.
+# LIT on FAST-WAM
 
-# FastWAM
+The **Latent Interface Training (LIT)** instantiation of *Breaking the Vision–Action Shortcut: Latent
+Interface Training for Generalizable Robot Foundation Models* on FAST-WAM.
+Cross-framework hub, project page and released checkpoints: https://github.com/jianmanlincjx/LIT ·
+https://jianmanlincjx.github.io/LIT/ · https://huggingface.co/linjianman/LIT
 
-Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future Imagination?**
+This is a fork of [FAST-WAM](https://github.com/yuantianyuan01/FastWAM); the original README is kept as [`README_upstream.md`](./README_upstream.md)
+(installation of the base framework lives there). Everything below is what this fork adds.
 
-[![English](https://img.shields.io/badge/README-English-111111.svg)](./README.md)
-[![中文](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-d14836.svg)](./README_zh.md)
 
-[![arXiv](https://img.shields.io/badge/arXiv-2603.16666-b31b1b.svg)](https://arxiv.org/abs/2603.16666)
-[![Project Page](https://img.shields.io/badge/Project_Page-Fast--WAM-2ea44f.svg)](https://yuantianyuan01.github.io/FastWAM/)
-[![Hugging Face Model](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Model-f7c843)](https://huggingface.co/yuanty/fastwam)
-[![Hugging Face Dataset - LIBERO](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20LIBERO-f7c843)](https://huggingface.co/datasets/yuanty/LIBERO-fastwam)
-[![Hugging Face Dataset - RoboTwin](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Dataset%20RoboTwin-f7c843)](https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam)
+This repository is the FAST-WAM codebase plus a two-stage **Latent Interface Training (LIT)**
+recipe. This page covers only what LIT adds; for the base model see `README.md`.
 
-This repository contains the training and evaluation code for FastWAM on LIBERO / RoboTwin.
+## What LIT changes
 
-## What's New
+The action expert is normally conditioned on backbone visual representations directly.
+LIT replaces that path:
 
-FastWAM is now faster, better suited to large-scale datasets, and more flexible
-for research. This update brings substantially faster training and inference,
-native LeRobot v3.0 support, and a new model that can switch between acting with
-and without future imagination.
+- **Stage 1** trains the action expert on language + robot state + each chunk's terminal
+  SE(3) end-effector pose, with no image observations. This yields a spatial-goal-conditioned
+  action prior that never sees appearance.
+- **Stage 2** restores vision, but only through 100 learnable latent tokens that aggregate
+  the backbone; raw visual tokens are masked out of the action expert, and 8 of the latents
+  are supervised to reconstruct the same terminal pose (`lambda_pose = 0.3`).
 
-### ⚡ Approximately 2x faster inference
+Stage 1's SE(3) encoder is training-time scaffolding — Stage 2 drops it and the latents
+predict the pose from vision, so no privileged input is needed at inference.
 
-End-to-end FastWAM inference is now approximately **2x faster**, including text
-encoding and VAE encoding:
+## Baseline
 
-- **NVIDIA H20:** 470 ms → 210 ms
-- **NVIDIA RTX 4090:** 190 ms → 110 ms
+The baseline is the released FAST-WAM checkpoint, evaluated as-is; we do not retrain it.
+See the Hugging Face link in `README.md`.
 
-The accelerated path is enabled by default for LIBERO with
-`EVALUATION.compile_action_infer=true`. We gratefully acknowledge
-[PR #43](https://github.com/yuantianyuan01/FastWAM/pull/43) for proposing the
-optimization ideas that inspired this work. Existing checkpoints remain fully
-compatible with the accelerated inference path.
+## Training LIT
 
-### 🚀 Approximately 10% faster training
-
-FastWAM training is approximately **10% faster on NVIDIA H20 GPUs**. The new
-training path combines a compiled denoising core with batched VAE encoding and
-a lightweight CUDA Graph backend. Enable denoising compilation with:
+Both stages use `configs/sim_libero_goal_prior.yaml`, on all four LIBERO suites
+(`libero_spatial / object / goal / 10`, `no_noops`).
 
 ```bash
-bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4 \
-  model.compile_training_denoise=true
+# Stage 1 — vision-free SE(3)-conditioned action prior
+python scripts/train.py task=sim_libero_goal_prior \
+  model.goal_prior_stage=stage1 \
+  batch_size=64 learning_rate=2e-4 warmup_steps=2000 max_steps=10000
+
+# Stage 2 — pose-supervised latent interface, initialised from Stage 1
+python scripts/train.py task=sim_libero_goal_prior \
+  model.goal_prior_stage=stage2 \
+  resume=<stage1_run>/checkpoints/weights/step_010000.pt \
+  batch_size=16 learning_rate=1e-4 max_steps=30000
 ```
 
-Both cached text embeddings and on-the-fly T5 encoding are supported. The
-latter skips text-cache preprocessing and is more convenient, at the cost of
-approximately 10% lower training throughput.
+Interface settings are identical to the other three backbones and were not tuned per model:
+`num_latents=100`, `num_pose_tokens=8`, `latent_dim=768`, `inner_dim=512`, `lambda_pose=0.3`.
 
-### 📦 Native LeRobot 2.1 and 3.0 support
+## Environment for evaluation
 
-FastWAM now supports both **LeRobot 2.1 and LeRobot 3.0** datasets. LeRobot 3.0's
-chunked parquet and video layout scales better to large datasets, with faster
-data loading and dataset-statistics computation as the dataset grows.
-
-Download the released LeRobot 3.0 LIBERO dataset from
-[Hugging Face](https://huggingface.co/datasets/yuanty/LIBERO-fastwam) and select
-the v3.0 data config:
+`pyproject.toml` pins the model stack (torch 2.7.1+cu128) but not the simulator. Verified on a fresh
+machine on 2026-09-10 with:
 
 ```bash
-huggingface-cli download yuanty/LIBERO-fastwam \
-  --repo-type dataset \
-  --include "lerobot_v30/**" \
-  --local-dir ./data
+uv venv --python 3.12 .venv && source .venv/bin/activate
+UV_INDEX_STRATEGY=unsafe-best-match \
+UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128 uv pip install -e .
 
-python scripts/train.py task=libero_uncond_2cam224_1e-4 \
-  data=libero_2cam_lerobot_v30
+# LIBERO / LIBERO-Plus and their runtime deps (not declared by LIBERO-plus's setup.py)
+ln -s /path/to/LIBERO-plus third_party/LIBERO-plus
+uv pip install -e third_party/LIBERO-plus \
+  robosuite==1.4.0 bddl==1.0.1 gym==0.25.2 mujoco==3.8.1 \
+  Wand h5py scikit-image future easydict thop einops matplotlib cloudpickle imageio imageio-ffmpeg
 ```
 
-For another LeRobot 3.0 dataset, copy
-`configs/data/libero_2cam_lerobot_v30.yaml`, update `train.dataset_dirs`, and
-select the new config with `data=<config_name>`. Existing LeRobot 2.1 configs
-continue to work unchanged.
+`Wand` needs the ImageMagick shared library (`libMagickWand`) on the system. Do not install
+`robomimic` (its `egl-probe` dependency fails to build and is not needed).
 
-### 🧠 Optional IDM: one model, two thinking modes
+Backbone weights are resolved relative to the repository root: `checkpoints/` must contain
+`Wan-AI/` (Wan2.2-TI2V-5B and the Wan2.1 tokenizer), `ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt`
+and `prompt_cache.pt`, as for the released FAST-WAM.
 
-Optional IDM is a new FastWAM variant that supports **two inference modes in a
-single model**:
-
-- **IDM mode:** imagine the future video first, then predict actions.
-- **First-frame mode (Fast-WAM):** skip test-time future imagination and predict
-  actions directly from the current observation.
-
-Download the released Optional IDM checkpoint from
-[Hugging Face](https://huggingface.co/yuanty/fastwam):
+Pick the GPU with `CUDA_VISIBLE_DEVICES=<id>` and pass `gpu_id=0`; `gpu_id` indexes the visible devices.
+Single-task check (about 30 s for two rollouts):
 
 ```bash
-huggingface-cli download yuanty/fastwam \
-  libero_optional_idm_2cam224.pt \
-  libero_optional_idm_2cam224_dataset_stats.json \
-  --local-dir ./checkpoints/fastwam_release
+export PYTHONPATH=$PWD/third_party/LIBERO-plus:$PWD/src MUJOCO_GL=egl
+CUDA_VISIBLE_DEVICES=0 python experiments/libero/eval_libero_single.py --config-name sim_libero_goal_prior \
+  ckpt=<stage2>/step_030000.pt EVALUATION.dataset_stats_path=<stage2>/dataset_stats.json gpu_id=0 \
+  EVALUATION.task_suite_name=libero_spatial EVALUATION.task_id=0 EVALUATION.num_trials=2
 ```
 
-Train the optional-IDM variant once:
+## Evaluation
 
-```bash
-bash scripts/train_zero1.sh 8 task=libero_optional_idm_2cam224_1e-4
-```
-
-Then choose either inference mode at evaluation time without retraining, making
-it easy to study when future imagination helps:
+### LIBERO (in-distribution)
 
 ```bash
 python experiments/libero/run_libero_manager.py \
-  task=libero_optional_idm_2cam224_1e-4 \
-  ckpt=./checkpoints/fastwam_release/libero_optional_idm_2cam224.pt \
-  EVALUATION.dataset_stats_path=./checkpoints/fastwam_release/libero_optional_idm_2cam224_dataset_stats.json \
-  EVALUATION.sigma_shift=1.0 \
-  +EVALUATION.action_infer_mode=idm \
+  task=sim_libero_goal_prior \
+  ckpt=<stage2_run>/checkpoints/weights/step_030000.pt \
+  EVALUATION.dataset_stats_path=<stage2_run>/dataset_stats.json \
   MULTIRUN.num_gpus=8
 ```
 
-Replace `idm` with `first_frame` to use the Fast-WAM inference mode.
+### LIBERO-Plus (out of distribution)
 
-The released checkpoint, trained with action scheduler shift `1.0`, achieves
-the following success rates on the full LIBERO benchmark (40 tasks, 50 episodes
-per task):
-
-| Inference mode | Spatial | Goal | Object | Long | Average |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| IDM | 99.0% | 98.6% | 99.6% | 97.0% | **98.55%** |
-| First-frame (Fast-WAM) | 98.2% | 97.8% | 99.2% | 95.8% | **97.75%** |
-
-### Other improvements
-
-- The action scheduler shift now defaults to `1.0` for both training and
-  evaluation; shifts from `1.0` to `3.0` perform similarly in our experiments.
-  When evaluating the original released checkpoints, set
-  `EVALUATION.sigma_shift=5.0` to reproduce the original setting.
-- Upgraded LIBERO evaluation with persistent model workers, dynamic task
-  scheduling, bad-GPU quarantine, failure recovery, and resumable results.
-- Optimized action-only inference for IDM and Optional IDM: `infer_action`
-  returns actions and video latents directly, while VAE decoding is performed
-  only by `infer_joint` when video output is requested, eliminating redundant
-  computation in action-only deployments.
-
-## Index
-
-- [File Structure](#file-structure)
-- [Environment Setup](#environment-setup)
-- [Model Preparation](#model-preparation)
-- [Dataset Download](#dataset-download)
-- [Inference with Released Checkpoints](#inference-with-released-checkpoints)
-- [Training](#training)
-- [Inference with Your Trained Checkpoints](#inference-with-your-trained-checkpoints)
-- [Acknowledgements](#acknowledgements)
-- [BibTeX](#bibtex)
-
-## File Structure
-
-```text
-FastWAM/
-├── configs/
-│   ├── data/                 # Dataset configs (LIBERO, RoboTwin, etc.)
-│   ├── model/                # Model architecture and component configs
-│   └── task/                 # Task-level configs (training task names)
-├── scripts/
-│   ├── train.py
-│   ├── train_zero1.sh        # Deepspeed zero1 training entrypoint
-│   ├── preprocess_action_dit_backbone.py  # Preprocess ActionDiT backbone before training
-│   └── precompute_text_embeds.py  # Precompute T5 text embedding cache before training
-├── experiments/
-│   ├── libero/
-│   │   └── run_libero_manager.py
-│   └── robotwin/
-│       └── run_robotwin_manager.py
-├── src/fastwam/              # Core code
-├── runs/                     # Training outputs (ckpt, logs)
-├── checkpoints/              # Pretrained or external checkpoints
-├── data/                     # Data directory
-└── evaluate_results/         # Inference / evaluation results
-```
-
-## Environment Setup
+[LIBERO-Plus](https://github.com/sylvestf/LIBERO-plus) is 10,030 perturbed tasks over seven
+axes, one episode each. Point the manager at the LIBERO-Plus task set and set:
 
 ```bash
-conda create -n fastwam python=3.10 -y
-conda activate fastwam
-pip install -U pip
-pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
-pip install -e .
-```
-
-## Model Preparation
-
-This step is required before both training and inference.
-
-Step 1: set the Wan model directory first (opional, default `./checkpoints`):
-
-```bash
-mkdir -p checkpoints
-export DIFFSYNTH_MODEL_BASE_PATH="$(pwd)/checkpoints"
-```
-
-Step 2: pre-generate the ActionDiT backbone (interpolated from Wan22 DiT):
-
-```bash
-# uncond (fastwam)
-python scripts/preprocess_action_dit_backbone.py \
-  --model-config configs/model/fastwam.yaml \
-  --output checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt \
-  --device cuda \
-  --dtype bfloat16
-```
-
-## Dataset Download
-
-### LIBERO
-
-The preprocessed LIBERO dataset used by Fast-WAM is available at:
-
-- https://huggingface.co/datasets/yuanty/LIBERO-fastwam
-
-Download all compressed files first, then extract them all:
-
-```bash
-mkdir -p data/libero_mujoco3.3.2
-cd data/libero_mujoco3.3.2
-
-# Run after downloading all 4 tar.gz files
-for f in *.tar.gz; do
-  tar -xzf "$f"
-done
-```
-
-The extracted directory structure should be:
-
-```text
-data/libero_mujoco3.3.2/
-├── libero_10_no_noops_lerobot/
-├── libero_goal_no_noops_lerobot/
-├── libero_object_no_noops_lerobot/
-└── libero_spatial_no_noops_lerobot/
-```
-
-### RoboTwin
-
-The preprocessed RoboTwin dataset used by Fast-WAM is available at:
-
-- https://huggingface.co/datasets/yuanty/robotwin2.0-fastwam
-
-Download all split archive files first, then concatenate and extract:
-
-```bash
-mkdir -p data/robotwin2.0
-cd data/robotwin2.0
-
-# Run after downloading all robotwin2.0.tar.gz.part-* files
-cat robotwin2.0.tar.gz.part-* | tar -xzf -
-```
-
-The extracted directory structure should be:
-
-```text
-data/robotwin2.0/
-└── robotwin2.0/
-    ├── data/
-    ├── meta/
-    └── videos/
-```
-
-If you also keep:
-
-```text
-data/robotwin2.0/dataset_stats.json
-```
-
-in the root directory, it can be used directly as the statistics file for the current configs in this repo. You can also recompute it.
-
-## Inference with Released Checkpoints
-
-The released checkpoints and their corresponding dataset stats are available on [Hugging Face](https://huggingface.co/yuanty/fastwam).
-
-Optional: download released checkpoints and dataset stats from Hugging Face:
-
-```bash
-pip install -U huggingface_hub
-
-huggingface-cli download yuanty/fastwam \
-  libero_uncond_2cam224.pt \
-  libero_uncond_2cam224_dataset_stats.json \
-  libero_optional_idm_2cam224.pt \
-  libero_optional_idm_2cam224_dataset_stats.json \
-  robotwin_uncond_3cam_384.pt \
-  robotwin_uncond_3cam_384_dataset_stats.json \
-  --local-dir ./checkpoints/fastwam_release
-```
-
-After downloading, the local directory is expected to contain:
-
-```text
-checkpoints/fastwam_release/
-├── libero_uncond_2cam224.pt
-├── libero_uncond_2cam224_dataset_stats.json
-├── libero_optional_idm_2cam224.pt
-├── libero_optional_idm_2cam224_dataset_stats.json
-├── robotwin_uncond_3cam_384.pt
-└── robotwin_uncond_3cam_384_dataset_stats.json
-```
-
-Before running the `LIBERO` benchmark, install the official LIBERO environment first
-from the [LIBERO repository](https://github.com/Lifelong-Robot-Learning/LIBERO).
-Then run this final step:
-
-```bash
-pip install mujoco==3.3.2
-```
-
-The `mujoco` environment should ideally stay consistent with the LIBERO data version.
-
-We have already copied the `RoboTwin` evaluation-related code into `third_party/RoboTwin`.
-You still need to follow the official RoboTwin instructions from the
-[RoboTwin repository](https://github.com/RoboTwin-Platform/RoboTwin) to finish environment installation and download the required assets, then create the policy symlink:
-
-```bash
-ln -sfn "$(pwd)/experiments/robotwin/fastwam_policy" "$(pwd)/third_party/RoboTwin/policy/fastwam_policy"
-```
-
-Optional: evaluate released LIBERO checkpoint:
-
-The released `LIBERO` / `RoboTwin` evaluation managers default to `8` GPUs
-(`MULTIRUN.num_gpus=8` in `configs/sim_libero.yaml` and `configs/sim_robotwin.yaml`).
-If you want to evaluate with fewer GPUs, pass a smaller value such as
-`MULTIRUN.num_gpus=4`.
-
-```bash
-python experiments/libero/run_libero_manager.py \
-  task=libero_uncond_2cam224_1e-4 \
-  ckpt=./checkpoints/fastwam_release/libero_uncond_2cam224.pt \
-  EVALUATION.dataset_stats_path=./checkpoints/fastwam_release/libero_uncond_2cam224_dataset_stats.json \
-  EVALUATION.sigma_shift=5.0 \
+LIBERO_PLUS_FIX_LANG=1 python experiments/libero/run_libero_manager.py \
+  task=sim_libero_goal_prior \
+  ckpt=<stage2_run>/checkpoints/weights/step_030000.pt \
+  EVALUATION.dataset_stats_path=<stage2_run>/dataset_stats.json \
   MULTIRUN.num_gpus=8
 ```
 
-Optional: evaluate released RoboTwin checkpoint:
+**`LIBERO_PLUS_FIX_LANG=1` is required.** Upstream LIBERO-Plus derives the instruction from
+the perturbed file name, so on every non-language axis the policy is otherwise fed strings
+like `... view 0 0 100 2 352 initstate 0`. Numbers produced without it are not comparable.
 
-```bash
-python experiments/robotwin/run_robotwin_manager.py \
-  task=robotwin_uncond_3cam_384_1e-4 \
-  ckpt=./checkpoints/fastwam_release/robotwin_uncond_3cam_384.pt \
-  EVALUATION.dataset_stats_path=./checkpoints/fastwam_release/robotwin_uncond_3cam_384_dataset_stats.json \
-  EVALUATION.sigma_shift=5.0 \
-  MULTIRUN.num_gpus=8
-```
+## Attention figures
 
-For faster RoboTwin evaluation, we have enabled `EVALUATION.skip_get_obs_within_replan=true` in [`configs/sim_robotwin.yaml`](./configs/sim_robotwin.yaml).
-This skips RGB rendering while consecutively executing an action chunk within one replan window, which speeds up evaluation but makes the saved video look very low-FPS.
-Set it to `false` if you want to save a fully rendered video.
+`FASTWAM_ATTN_DUMP=1` captures the latent-to-image cross-attention weights during evaluation
+(off by default; the normal forward path keeps `need_weights=False`).
 
-**Note:** We evaluate with **unseen** instructions, following Motus. [Lingbot-VA](https://github.com/Robbyant/lingbot-va/blob/661d52a59dc634a650efcd10a79d06bbb17ea81f/evaluation/robotwin/eval_polict_client_openpi.py#L308) uses **seen** instructions instead. You can try `EVALUATION.instruction_type=seen` to use **seen** instructions, which should theoretically improve performance by one or two points.
+## Checkpoints
 
-## Training
+Released as `fastwam/lit_stage1` and `fastwam/lit_stage2` (https://huggingface.co/linjianman/LIT), each with
+`model.pt`, `config.yaml` and `dataset_stats.json`: `ckpt=<dir>/model.pt`
+`EVALUATION.dataset_stats_path=<dir>/dataset_stats.json`. The baseline is the released FAST-WAM checkpoint.
 
-### 1) Precompute T5 embedding cache before training
+## The same method on other backbones
 
-Use `scripts/precompute_text_embeds.py` to precompute embeddings for each training task:
-
-```bash
-# LIBERO
-python scripts/precompute_text_embeds.py task=libero_uncond_2cam224_1e-4
-
-# RoboTwin
-python scripts/precompute_text_embeds.py task=robotwin_uncond_3cam_384_1e-4
-```
-
-For multi-GPU:
-
-```bash
-torchrun --standalone --nproc_per_node=8 scripts/precompute_text_embeds.py task=libero_uncond_2cam224_1e-4
-```
-
-### 2) Training (using `fastwam` as an example)
-
-When running a new task for the first time, set `pretrained_norm_stats` in the corresponding `configs/data/*.yaml` to `null` first.
-After one training run, a `dataset_stats.json` file will be generated in the current run directory (for example, `runs/{task_name}/{run_id}/dataset_stats.json`).
-You can then update `pretrained_norm_stats` to that file path for subsequent runs.
-
-```bash
-# LIBERO
-bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4
-
-# RoboTwin
-bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
-```
-
-For LIBERO, we train on a single node with 8 GPUs. For RoboTwin, we use 64 GPUs to accelerate training. You can try reducing the GPU count or training epochs.
-
-## Inference with Your Trained Checkpoints
-
-The `mujoco` environment should ideally stay consistent with the LIBERO data version. Then run LIBERO evaluation:
-
-```bash
-# LIBERO
-python experiments/libero/run_libero_manager.py task={task_name} ckpt={ckpt_path}
-```
-
-We have already copied the `RoboTwin` evaluation-related code into `third_party/RoboTwin`.
-You still need to follow the official RoboTwin instructions from the
-[RoboTwin repository](https://github.com/RoboTwin-Platform/RoboTwin).
-Finish installation and download the required assets, then create the policy symlink:
-
-```bash
-ln -sfn "$(pwd)/experiments/robotwin/fastwam_policy" "$(pwd)/third_party/RoboTwin/policy/fastwam_policy"
-```
-
-Then run RoboTwin evaluation:
-
-```bash
-python experiments/robotwin/run_robotwin_manager.py task={task_name} ckpt={ckpt_path}
-```
-
-Common `task_name` examples:
-
-```text
-libero_uncond_2cam224_1e-4
-robotwin_uncond_3cam_384_1e-4
-```
-
-## Acknowledgements
-
-The RoboTwin evaluation code in this repository is adapted from the official [RoboTwin repository](https://github.com/RoboTwin-Platform/RoboTwin). We thank the RoboTwin team for releasing their codebase and assets.
-
-## BibTeX
-
-If you find our work helpful, please consider citing:
-
-```bibtex
-@article{yuan2026fastwam,
-  title={Fast-WAM: Do World Action Models Need Test-time Future Imagination?},
-  author={Tianyuan Yuan and Zibin Dong and Yicheng Liu and Hang Zhao},
-  journal={arXiv preprint arXiv:2603.16666},
-  year={2026},
-  url={https://arxiv.org/abs/2603.16666}
-}
-```
+π0.5 `jianmanlincjx/pi05` · MolmoAct2 `jianmanlincjx/Molmoact2` · ImageWAM `jianmanlincjx/ImageWAM`
