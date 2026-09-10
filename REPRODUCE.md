@@ -114,7 +114,7 @@ like `... view 0 0 100 2 352 initstate 0`. Numbers produced without it are not c
 
 ## Checkpoints
 
-Released as `fastwam/lit_stage1` and `fastwam/lit_stage2` (Hugging Face, link in the LIT hub), each with
+Released as `fastwam/lit_stage1` and `fastwam/lit_stage2` (https://huggingface.co/linjianman/LIT), each with
 `model.pt`, `config.yaml` and `dataset_stats.json`: `ckpt=<dir>/model.pt`
 `EVALUATION.dataset_stats_path=<dir>/dataset_stats.json`. The baseline is the released FAST-WAM checkpoint.
 
