@@ -3,7 +3,7 @@
 The **Latent Interface Training (LIT)** instantiation of *Breaking the Vision–Action Shortcut: Latent
 Interface Training for Generalizable Robot Foundation Models* on FAST-WAM.
 Hub, project page, checkpoints: https://github.com/jianmanlincjx/LIT · https://jianmanlincjx.github.io/LIT/ ·
-https://huggingface.co/linjianman/LIT
+https://huggingface.co/linjianman/LIT (public; Stage 1 and Stage 2 for every backbone)
 
 This is a fork of [FastWAM](https://github.com/yuantianyuan01/FastWAM) (original README:
 [`README_upstream.md`](./README_upstream.md) — installation, data preparation, the released weights).
@@ -88,6 +88,8 @@ python scripts/train.py task=sim_libero_goal_prior model.goal_prior_stage=stage2
   resume=<stage1_run>/checkpoints/weights/step_010000.pt \
   batch_size=16 learning_rate=1e-4 max_steps=30000
 ```
+
+To skip Stage 1, use the released prior: `resume=./LIT_ckpt/fastwam/lit_stage1/model.pt`.
 
 Then evaluate `<stage2_run>/checkpoints/weights/step_030000.pt` with `<stage2_run>/dataset_stats.json`
 exactly as in §1 (the released `lit_stage2/model.pt` is that file, renamed).
